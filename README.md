@@ -87,6 +87,4 @@ streamlit run app.py
 | HTTP Client    | httpx / huggingface-hub                  |
 | Language       | Python 3.11+                             |
 
-## License
 
-MIT
