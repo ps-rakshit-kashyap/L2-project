@@ -45,8 +45,8 @@ It is **not** a simple chatbot. It is a true **agent** that plans multiple steps
 ┌─────────────────────────────────────────────────────────────┐
 │                  Agent Controller (agent_controller.py)      │
 │  ┌─────────┐  ┌──────────┐  ┌────────────┐  ┌───────────┐  │
-│  │ Planner │  │ Executor │  │  Memory    │  │ HF API   │  │
-│  │(ReAct)  │  │(MCP call)│  │(steps/ctx) │  │(Mistral)│  │
+│  │ Planner │  │ Executor │  │  Memory    │  │ Ollama   │  │
+│  │(ReAct)  │  │(MCP call)│  │(steps/ctx) │  │(Qwen 3.5)│  │
 │  └─────────┘  └────┬─────┘  └────────────┘  └───────────┘  │
 └─────────────────────┼───────────────────────────────────────┘
                       │ MCP protocol (JSON-RPC over stdio)
@@ -132,7 +132,7 @@ When the agent calls `session.call_tool("read_resume", {"file_path": "..."})`, t
 | Tool | Input | Output | Purpose |
 |------|-------|--------|---------|
 | `read_resume` | `file_path` (str) | `{summary, skills, projects, experience, education}` | Parse PDF resume |
-| `analyze_job_description` | `job_description` (str) | `{role, required_skills, preferred_skills, keywords}` | Extract JD requirements |
+| `analyze_job_description` | `job_description` (str) | `{role, required_skills, keywords}` | Extract JD requirements |
 | `skill_gap_analysis` | `resume_data`, `job_data` | `{matched_skills, missing_skills, score}` | Compare skills |
 | `ats_score` | `resume_data`, `job_data` | `{score, recommendations}` | ATS compatibility |
 | `rank_projects` | `projects`, `job_description` | `{ranked_projects}` | Sort by relevance |
@@ -197,7 +197,7 @@ Action: tool_name
 Action Input: {"param": "value"}
 ```
 
-The LLM (Mistral 7B via HF Inference API) then outputs:
+The LLM (Qwen 3.5 via Ollama) then outputs:
 
 ```
 Action: analyze_job_description
@@ -206,7 +206,7 @@ Action Input: {"job_description": "..."}
 
 ### Fallback Plan (No LLM)
 
-If the HF Inference API is unreachable (no API key, network issue, rate limit), the agent doesn't crash. It uses `_fallback_decision()` which follows a hardcoded plan:
+If Ollama is unreachable (not running, model not pulled, timeout), the agent doesn't crash. It uses `_fallback_decision()` which follows a hardcoded plan:
 
 ```python
 def _fallback_decision(self, step_idx):
@@ -239,7 +239,7 @@ This makes the agent **resilient** — it works with or without the LLM.
 |----------|---------|
 | `init_session_state()` | Sets up Streamlit session variables |
 | `progress_callback()` | Called by agent after each step — updates UI |
-| `_render_status()` | Shows ✅/⏳ step indicators |
+| `_render_status()` | Shows step indicators |
 | `run_agent()` | Creates AgentController and runs it asynchronously |
 | `display_results()` | Renders the 5-tab results view |
 | `main()` | Top-level UI layout and event handler |
@@ -254,6 +254,8 @@ This makes the agent **resilient** — it works with or without the LLM.
 - `st.download_button` — Export report as .md.
 
 **Async handling:** Streamlit is synchronous. The agent uses `asyncio`. We bridge them by creating a new event loop and calling `loop.run_until_complete(run_agent(...))`. This keeps the UI responsive during agent execution.
+
+**Note on sidebar:** The sidebar currently references "Qwen 3.5 via Ollama + MCP" but also has an outdated Ollama troubleshooting message referencing the wrong model. These are cosmetic and don't affect functionality.
 
 ---
 
@@ -282,6 +284,21 @@ This makes the agent **resilient** — it works with or without the LLM.
 2. **Read** by `_fill_tool_inputs()` for subsequent tool calls.
 3. **Assembled** by `_generate_final_report()` at the end.
 
+**TOOL_INPUT_MAP:** Maps tool names to their required context dependencies. Used by `_fill_tool_inputs()` to auto-populate parameters:
+
+```python
+TOOL_INPUT_MAP = {
+    "read_resume": "file_path",
+    "analyze_job_description": "job_description",
+    "skill_gap_analysis": "resume_data+job_data",
+    "ats_score": "resume_data+job_data",
+    "rank_projects": "projects+job_description",
+    "tailor_resume": "resume_data+job_data",
+}
+```
+
+**Why this matters:** The LLM only needs to say "call skill_gap_analysis" — the controller automatically attaches the resume_data and job_data from its context. The LLM never needs to pass large data blobs.
+
 ---
 
 ### `agent/memory.py` — Agent Memory
@@ -290,7 +307,7 @@ This makes the agent **resilient** — it works with or without the LLM.
 
 **Classes:**
 
-- **`AgentStep`** — One ReAct cycle (thought + action + observation).
+- **`AgentStep`** — One ReAct cycle (thought + action + observation). Timestamped for traceability.
 - **`AgentMemory`** — Collection of steps, plus a generic context dict.
 
 The memory serves two purposes:
@@ -323,6 +340,8 @@ The `@mcp.tool()` decorator:
 2. Uses type hints to generate the JSON schema for tool parameters.
 3. Handles JSON-RPC serialization/deserialization automatically.
 
+**Important:** The server never runs standalone in production. It is always spawned as a subprocess by `agent_controller.py` via `StdioServerParameters`.
+
 ---
 
 ### `mcp_server/resume_tools.py` — Resume Reading
@@ -344,7 +363,7 @@ The `@mcp.tool()` decorator:
 
 **`analyze_job_description(jd)`:**
 - Runs `SkillExtractor.extract_skills()` on the JD text.
-- Returns the detected skills as `required_skills` and lowercase versions as `keywords`.
+- Returns detected skills as `required_skills` and lowercase versions as `keywords`.
 
 **`skill_gap_analysis(resume_data, job_data)`:**
 - Converts both skill lists to lowercase sets.
@@ -367,36 +386,29 @@ The `@mcp.tool()` decorator:
 - Sorts by overlap count descending.
 
 **`tailor_resume(resume_data, job_data)`:**
-- Computes matched/missing skills.
+- Computes matched/missing skills via case-insensitive set comparison.
 - Builds tailored skills list: matched skills first, then up to 5 missing skills.
-- Generates a simple professional summary highlighting matched skills.
+- Generates a simple professional summary highlighting matched expertise.
 
 ---
 
-### `models/hf_client.py` — LLM Client (Active)
+### `models/ollama_client.py` — LLM Client (Active)
 
-**What it does:** HTTP client for Hugging Face Inference API's chat completions endpoint.
+**What it does:** HTTP client for Ollama's `/api/generate` endpoint.
 
 **Key details:**
-- Uses `huggingface-hub`'s `InferenceClient` under the hood.
-- Default model: `mistralai/Mistral-7B-Instruct-v0.3`.
-- Endpoint: `https://router.huggingface.co/hf-inference/models/{model}/v1/chat/completions`.
-- Timeout: 30 seconds (HF infra is fast).
-- Error handling: clear messages for auth errors, missing model, rate limits.
-
-**Why HF Inference API instead of Ollama?** The original Ollama-based client (`models/ollama_client.py`, now deprecated) ran Qwen 3.5 locally but repeatedly timed out (60s+ per request) on the user's hardware, making ReAct reasoning non-functional. HF Inference API provides fast hosted inference (1-5s per request) with access to stronger models, no local GPU required, and a free tier.
-
-### `models/ollama_client.py` — LLM Client (Deprecated / Reference)
-
-**What it does:** HTTP client for Ollama's `/api/generate` endpoint. **No longer imported or used.**
-
-**Why deprecated:** Local Qwen 3.5 via Ollama repeatedly timed out (60s+ per request), causing every ReAct step to fall through to the fallback plan. Replaced by `hf_client.py` (Hugging Face Inference API).
-
-**Reference details (kept for local-only setups):**
 - Uses `httpx` for HTTP with connection pooling.
 - Default model: `qwen3.5:2b-q4_K_M`.
 - Default endpoint: `http://localhost:11434`.
-- Error handling: clear messages for connection refused and 404 (model not pulled).
+- Timeout: 60 seconds (Ollama on CPU can be slow).
+- Pydantic models: `GenerationConfig` and `OllamaResponse` for request/response validation.
+
+**Error handling:**
+- `ConnectionError` — Ollama not running (provide clear message to run `ollama serve`).
+- `ValueError` — Model not found (provide clear message to run `ollama pull`).
+- Generic `RuntimeError` — Other HTTP errors.
+
+**Why Ollama instead of a cloud API?** The project was designed to run fully locally with no cloud dependencies. Qwen 3.5 provides reasonable reasoning capability for the ReAct loop while running on consumer hardware. If Ollama is too slow on a given machine, the agent auto-falls back to the deterministic plan.
 
 ---
 
@@ -418,7 +430,7 @@ SECTION_PATTERNS = {
 
 Each pattern uses a lookahead `(?=...)` to find the next section heading without consuming it, so subsequent patterns can match correctly.
 
-**Section parsing:** For list-type sections (skills, projects, experience, education), the content is split into lines. Skills are further split by commas and pipes for fine-grained extraction.
+**Section parsing:** For list-type sections (skills, projects, experience, education), the content is split into lines. Skills are further split by commas, pipes, and slashes for fine-grained extraction.
 
 **Fallback:** If no sections are detected (unusual resume format), the first 10 lines are used as a summary.
 
@@ -438,12 +450,12 @@ Each pattern uses a lookahead `(?=...)` to find the next section heading without
 
 **What it does:** Calculates ATS compatibility scores and generates recommendations.
 
-**Scoring formula:** `(matched_skills / total_job_skills) * 100`, capped at 100.
+**Scoring formula:** `(len(matched_skills) / len(total_job_skills)) * 100`, capped at 100.
 
 **Recommendations:** Generated based on the gap analysis:
-1. If skills are missing, suggests adding them.
+1. If skills are missing, suggests adding them with specific skill names.
 2. If fewer than 3 skills matched, suggests increasing keyword density.
-3. Always includes general best practices (action verbs, quantify achievements, consistent formatting, etc.).
+3. Always includes general best practices (action verbs, quantify achievements, consistent formatting, 1-2 pages, standard headings).
 
 ---
 
@@ -505,7 +517,7 @@ job_data ──────────── skill_gap_analysis ─────
                         │                              │
                         └── tailor_resume              │
                                                        │
-rank_projects ←─────────────────────────────────────── resum├e_data.projects + job_description
+rank_projects ←────────────────────────────────────── resume_data.projects + job_description
 ```
 
 Tool calls that depend on prior data:
@@ -514,15 +526,15 @@ Tool calls that depend on prior data:
 - `rank_projects` needs `resume_data.projects` and the raw `job_description`.
 - `tailor_resume` needs both `resume_data` and `job_data`.
 
-The agent controller handles this automatically via `_fill_tool_inputs()` — if a tool is called before its dependencies are available, the controller will wait (the LLM naturally follows the correct order because the ReAct prompt shows what's available and what's not).
+The agent controller handles this automatically via `_fill_tool_inputs()` — if a tool is called before its dependencies are available, the controller will fill them from context. In practice, the LLM naturally follows the correct order because the ReAct prompt shows what's available and what's not.
 
 ---
 
 ## 7. Error Handling & Fallbacks
 
-### If the HF Inference API is unavailable
+### If Ollama is Unavailable
 
-The `HFClient.generate()` call raises an exception (network error, invalid token, rate limit). The agent controller catches it:
+The `OllamaClient.generate()` call raises an exception (connection refused, model not found, timeout). The agent controller catches it:
 
 ```python
 try:
@@ -540,17 +552,17 @@ except Exception as e:
 Key details:
 - After the **first** failure, `_llm_available` is set to `False`, skipping all subsequent LLM calls.
 - Remaining steps use the deterministic fallback plan (instant, no waiting).
-- Without any API key, all steps use the fallback (the agent still works).
+- Without Ollama running, all steps use the fallback (the agent still works).
 
-### If the PDF is invalid
+### If the PDF is Invalid
 
 `read_resume` catches parsing errors and returns empty data with an `"error"` key. Downstream tools handle missing data gracefully (default empty lists, zero scores).
 
-### If an MCP tool call fails
+### If an MCP Tool Call Fails
 
 The `session.call_tool()` call is wrapped in try-except. On failure, the observation is set to `{"error": str(e)}` and the agent continues with the next step.
 
-### If the MCP server fails to start
+### If the MCP Server Fails to Start
 
 The `stdio_client` context manager throws an exception, caught by the outer try-except in `run()`. Returns `{"error": str(e)}` along with any partial results.
 
@@ -572,33 +584,44 @@ The `stdio_client` context manager throws an exception, caught by the outer try-
 
 ### Changing the LLM Model
 
-In the Streamlit sidebar, select a different model from the dropdown, or in `app.py`:
+In `agent_controller.py`, change the default model in `__init__`:
 
 ```python
-controller = AgentController(
-    hf_model="meta-llama/Meta-Llama-3-8B-Instruct",
-    hf_api_key="hf_..."
-)
+controller = AgentController(llm_model="llama3.2:3b")
 ```
 
-To switch back to local Ollama (if your hardware supports it), swap the client in `agent_controller.py`:
+Or pull a different model with Ollama:
+
+```powershell
+ollama pull llama3.2:3b
+```
+
+### Using a Cloud LLM Instead of Ollama
+
+To switch from local Ollama to a cloud API (e.g., Hugging Face, OpenAI):
+
+1. Create a new client in `models/` (e.g., `models/hf_client.py`) that implements a `generate(prompt, system, temperature)` method.
+2. Swap the client in `agent_controller.py`:
 
 ```python
-# from models.hf_client import HFClient    # comment out
-from models.ollama_client import OllamaClient  # restore
+# from models.ollama_client import OllamaClient
+from models.hf_client import HFClient
 
 # In __init__:
-# self.llm = HFClient(...)   # comment out
-self.llm = OllamaClient(model="qwen3.5:2b-q4_K_M")
+# self.llm = OllamaClient(model=llm_model)
+self.llm = HFClient(api_key="hf_...", model="mistralai/Mistral-7B-Instruct-v0.3")
 ```
 
 ### Improving Skill Detection
 
 Edit `utils/skill_extractor.py` — add or remove entries from `SKILL_KEYWORDS`. The extractor does case-insensitive regex matching, so entries should use proper casing for display.
 
-### Adding PDF Export
+### `prompt.txt` — Original Build Prompt
 
-The `report_text` field is Markdown. Streamlit's `st.download_button` already allows downloading it. To add direct PDF generation, you could integrate `weasyprint` or `pdfkit` in `app.py`.
+The file `prompt.txt` at the project root contains the exact prompt that was given to an LLM to generate this entire project. It serves as:
+- A reference for the original requirements.
+- A specification document showing what was asked for vs what was built.
+- A starting point for regenerating or re-architecting the project.
 
 ---
 
@@ -613,11 +636,11 @@ The `report_text` field is Markdown. Streamlit's `st.download_button` already al
 | `mcp_server/resume_tools.py` | MCP Tool | read_resume implementation |
 | `mcp_server/analysis_tools.py` | MCP Tools | analyze_jd, skill_gap, ats_score implementations |
 | `mcp_server/tailoring_tools.py` | MCP Tools | rank_projects, tailor_resume implementations |
-| `models/hf_client.py` | LLM Client **(active)** | Hugging Face Inference API (Mistral 7B) |
-| `models/ollama_client.py` | LLM Client (deprecated) | Local Ollama — kept as reference |
+| `models/ollama_client.py` | LLM Client | Ollama HTTP client (Qwen 3.5) |
 | `utils/pdf_parser.py` | Utility | PDF text extraction and section splitting |
-| `utils/skill_extractor.py` | Utility | Keyword-based skill detection |
+| `utils/skill_extractor.py` | Utility | Keyword-based skill detection (~130 skills) |
 | `utils/ats.py` | Utility | ATS scoring and recommendation generation |
+| `prompt.txt` | Docs | Original LLM prompt that generated this project |
 | `requirements.txt` | Config | Python package dependencies |
 | `README.md` | Docs | Setup and run instructions |
 | `UNDERSTANDING.md` | Docs | This document |

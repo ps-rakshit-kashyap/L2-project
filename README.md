@@ -1,6 +1,6 @@
 # Resume Tailoring Agent (MCP + AI Agent)
 
-An autonomous AI agent that tailors resumes to job descriptions using **MCP (Model Context Protocol)**, **Hugging Face Inference API** (Mistral 7B), **Python**, and **Streamlit**.
+An autonomous AI agent that tailors resumes to job descriptions using **MCP (Model Context Protocol)**, **Ollama** (Qwen 3.5), **Python**, and **Streamlit**.
 
 The agent reads a resume PDF, analyzes a job description, performs skill gap analysis, calculates ATS scores, ranks projects, and generates a tailored resume — all through autonomous ReAct-style reasoning.
 
@@ -19,13 +19,16 @@ resume-agent/
 │   ├── analysis_tools.py     # analyze_jd, skill_gap, ats_score
 │   └── tailoring_tools.py    # rank_projects, tailor_resume
 ├── models/
-│   ├── hf_client.py          # Hugging Face Inference API client **(active)**
-│   └── ollama_client.py      # DEPRECATED — local Ollama client (reference only)
+│   └── ollama_client.py      # Ollama HTTP client (Qwen 3.5)
 ├── utils/
 │   ├── pdf_parser.py         # PyMuPDF resume parser
 │   ├── skill_extractor.py    # Keyword-based skill detection
 │   └── ats.py                # ATS scoring & recommendations
-└── output/                   # Uploaded PDFs saved here
+├── output/                   # Uploaded PDFs saved here
+├── prompt.txt                # Original LLM prompt used to build this project
+├── README.md                 # This file
+├── UNDERSTANDING.md           # Deep-dive project documentation
+└── .gitignore
 ```
 
 ## Agent Workflow
@@ -42,12 +45,13 @@ User Goal: "Tailor my resume for this job."
   Step 7: Final Report          → All results assembled
 ```
 
-Each step is decided by the LLM (ReAct reasoning via Hugging Face Inference API) or via a deterministic fallback plan if the API is unavailable.
+Each step is decided by the LLM (ReAct reasoning via Ollama) or via a deterministic fallback plan if Ollama is unavailable.
 
 ## Prerequisites
 
 - Python 3.11+
-- [Hugging Face API token](https://huggingface.co/settings/tokens) (free — paste in app sidebar)
+- [Ollama](https://ollama.ai) installed and running
+- Qwen 3.5 model pulled: `ollama pull qwen3.5:2b-q4_K_M`
 
 ## Setup & Run
 
@@ -59,32 +63,41 @@ python -m venv venv
 pip install -r requirements.txt
 ```
 
-### 2. Run the App
+### 2. Ensure Ollama is Running
+
+```powershell
+ollama serve
+```
+
+In a separate terminal, verify the model is available:
+
+```powershell
+ollama pull qwen3.5:2b-q4_K_M
+```
+
+### 3. Run the App
 
 ```powershell
 streamlit run app.py
 ```
 
-### 3. Use
+### 4. Use
 
-1. Paste your **Hugging Face API token** in the sidebar.
-2. Upload a resume PDF.
-3. Paste a job description.
-4. Click **Analyze & Tailor Resume**.
-5. View the results in the tabs.
+1. Upload a resume PDF.
+2. Paste a job description.
+3. Click **Analyze & Tailor Resume**.
+4. View the results in the tabs.
 
-> **Note:** The agent works **with or without an API key**. Without it, the LLM reasoning step is skipped and the agent follows a deterministic fallback plan through all 6 tools.
+> **Note:** The agent works **with or without Ollama**. Without it, the LLM reasoning step is skipped and the agent follows a deterministic fallback plan through all 6 tools.
 
 ## Tech Stack
 
 | Component      | Technology                               |
 |----------------|------------------------------------------|
 | Frontend       | Streamlit                                |
-| LLM            | Mistral 7B (via Hugging Face Inference)  |
+| LLM            | Qwen 3.5 (via Ollama)                    |
 | Protocol       | MCP (Model Context Protocol)             |
 | PDF Parsing    | PyMuPDF (fitz)                           |
 | Validation     | Pydantic                                 |
-| HTTP Client    | httpx / huggingface-hub                  |
+| HTTP Client    | httpx                                    |
 | Language       | Python 3.11+                             |
-
-
