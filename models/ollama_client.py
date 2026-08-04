@@ -49,7 +49,7 @@ class OllamaClient:
         self,
         model: str = "qwen3.5:2b-q4_K_M",
         base_url: str = "http://localhost:11434",
-        timeout: float = 60.0,
+        timeout: float = 600.0,
     ):
         """Initialize the Ollama client.
         
@@ -88,9 +88,11 @@ class OllamaClient:
             "model": self.model,
             "prompt": prompt,
             "stream": False,
+            "think": False,          # Disable Qwen3 "thinking mode" — otherwise it burns
+                                     # all tokens on reasoning and returns an empty response.
             "temperature": temperature,
             "options": {
-                "num_predict": 2048,  # Maximum tokens to generate
+                "num_predict": 256,  # ReAct responses are short — no need for 2048 tokens
             },
         }
         if system:
@@ -101,7 +103,15 @@ class OllamaClient:
             response = self._client.post("/api/generate", json=payload)
             response.raise_for_status()
             data = response.json()
-            return data.get("response", "").strip()
+            text = data.get("response", "").strip()
+            if not text:
+                # Defensive guard — an empty response would make the agent
+                # think it's done and produce an empty report.
+                raise RuntimeError(
+                    "Ollama returned an empty response. "
+                    "Check that the model supports the requested output format."
+                )
+            return text
         except httpx.ConnectError:
             # Ollama not running — provide clear error message
             raise ConnectionError(

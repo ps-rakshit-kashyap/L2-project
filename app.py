@@ -77,6 +77,8 @@ def init_session_state() -> None:
     """
     if "status_items" not in st.session_state:
         st.session_state.status_items = {}
+    if "step_results" not in st.session_state:
+        st.session_state.step_results = {}
     if "agent_running" not in st.session_state:
         st.session_state.agent_running = False
     if "results" not in st.session_state:
@@ -114,14 +116,17 @@ def progress_callback(action: str, data: Dict[str, Any]) -> None:
     # Mark this step as complete
     st.session_state.status_items[action] = "complete"
 
+    # Store the observation for this step so it can be shown inline
+    st.session_state.step_results[action] = data
+
     # Update the status display (placeholder container in the UI)
     status_placeholder = st.session_state.get("status_placeholder")
     if status_placeholder is not None:
         with status_placeholder.container():
-            _render_status(st.session_state.status_items)
+            _render_status(st.session_state.status_items, st.session_state.step_results)
 
 
-def _render_status(status_items: Dict[str, str]) -> None:
+def _render_status(status_items: Dict[str, str], step_results: Dict[str, Any]) -> None:
     """Render the step-by-step status indicators.
     
     Shows each step with a status icon:
@@ -129,18 +134,44 @@ def _render_status(status_items: Dict[str, str]) -> None:
     - ℹ️ Currently running steps (info)
     - ⏳ Future steps (text)
     
+    For completed steps, a truncated JSON snippet of the MCP result
+    is shown inline beneath the step label.
+    
     Args:
         status_items: Dict mapping step names to their status ("complete" or missing).
+        step_results: Dict mapping step names to their MCP observations.
     """
     for step_name in STEP_ORDER:
         label = STEP_LABELS.get(step_name, step_name)
         status = status_items.get(step_name)
         if status == "complete":
             st.success(f"{label}")
+            _render_step_result(step_name, step_results.get(step_name))
         elif status == "running":
             st.info(f"{label}")
         else:
             st.text(f"⏳ {label}")
+
+
+def _render_step_result(step_name: str, result: Any) -> None:
+    """Render a truncated JSON snippet of an MCP result below a step label.
+    
+    Args:
+        step_name: The action/step name.
+        result: The observation dict returned by the MCP tool (may be None/empty).
+    """
+    if result is None or result == {}:
+        return
+    if step_name in ("initialized", "finalizing"):
+        return
+    try:
+        result_json = json.dumps(result, indent=2, default=str)
+    except (TypeError, ValueError):
+        result_json = str(result)
+    if len(result_json) > 800:
+        result_json = result_json[:800] + "\n..."
+    with st.expander("Result", expanded=False):
+        st.code(result_json, language="json")
 
 
 async def run_agent(resume_path: str, job_description: str) -> Dict[str, Any]:
@@ -396,6 +427,7 @@ def main() -> None:
         st.session_state.agent_running = True
         st.session_state.results = None
         st.session_state.status_items = {}
+        st.session_state.step_results = {}
         st.session_state.current_step = 0
 
         # Save uploaded PDF to disk

@@ -160,13 +160,18 @@ for step_idx in range(max_steps):
     
     # 2. Ask LLM what to do
     llm_response = self.llm.generate(prompt, system=REACT_SYSTEM_PROMPT)
-    action, action_input = self._parse_action(llm_response)
+    action, action_input, thought = self._parse_action(llm_response)
     
-    # 3. Execute via MCP
+    # 3. Validate the choice — override invalid/repeated/out-of-order tools
+    action, action_input = self._validate_decision(
+        action, action_input, tool_names, completed_tools
+    )
+    
+    # 4. Execute via MCP
     mcp_result = await session.call_tool(action, filled_input)
     observation = self._parse_mcp_result(mcp_result)
     
-    # 4. Store result and update context
+    # 5. Store result and update context
     self._store_result(action, observation)
     self.memory.add_step(step)
 ```
@@ -193,37 +198,75 @@ Step: read_resume
 Resume skills: ['Python', 'SQL', 'Git']
 
 What is the next action?
-Action: tool_name
-Action Input: {"param": "value"}
+Thought: I need the job requirements to compare against.
+Action: analyze_job_description
+Action Input: {"job_description": "..."}
 ```
 
 The LLM (Qwen 3.5 via Ollama) then outputs:
 
 ```
+Thought: I need the job requirements to compare against.
 Action: analyze_job_description
 Action Input: {"job_description": "..."}
 ```
 
-### Fallback Plan (No LLM)
+The `Thought:` line is parsed and stored in agent memory — it appears in the "Workflow Log" tab so you can see the model's actual reasoning.
 
-If Ollama is unreachable (not running, model not pulled, timeout), the agent doesn't crash. It uses `_fallback_decision()` which follows a hardcoded plan:
+### Fallback Plan (No LLM) & Guided Validation
+
+**Fallback when Ollama is unreachable** (not running, model not pulled, timeout, empty response): the agent doesn't crash. `_fallback_decision()` walks the `ORDERED_TOOLS` list, which is the hardcoded plan:
 
 ```python
+ORDERED_TOOLS = [
+    "read_resume",
+    "analyze_job_description",
+    "skill_gap_analysis",
+    "ats_score",
+    "rank_projects",
+    "tailor_resume",
+]
+
 def _fallback_decision(self, step_idx):
-    ordered_tools = [
-        ("read_resume", {}),
-        ("analyze_job_description", {}),
-        ("skill_gap_analysis", {}),
-        ("ats_score", {}),
-        ("rank_projects", {}),
-        ("tailor_resume", {}),
-    ]
-    if step_idx < len(ordered_tools):
-        return ordered_tools[step_idx]
-    return ("FINAL", {})
+    if step_idx < len(ORDERED_TOOLS):
+        tool = ORDERED_TOOLS[step_idx]
+        return (tool, {}, f"Using fallback plan (Ollama unavailable): calling {tool}.")
+    return ("FINAL", {}, "")
 ```
 
-This makes the agent **resilient** — it works with or without the LLM.
+**Guided validation even when the LLM IS available:** a small local model (Qwen 3.5 2B) frequently proposes invalid, repeated, or out-of-order tool calls. `_validate_decision()` only accepts the LLM's choice when it is a known, not-yet-completed tool whose data dependencies are satisfied. Otherwise it falls back to `_next_planned_tool()` — the first pending tool in `ORDERED_TOOLS`.
+
+```python
+def _validate_decision(self, action, action_input, tool_names, completed_tools):
+    if action not in tool_names or action in completed_tools or not self._deps_satisfied(action):
+        return self._next_planned_tool(completed_tools)
+    return (action, action_input)
+```
+
+`_deps_satisfied()` is what prevents the bug where `skill_gap_analysis` runs before `analyze_job_description` (no `job_data` yet):
+
+```python
+def _deps_satisfied(self, action):
+    if action in ("read_resume", "analyze_job_description"):
+        return True
+    if action in ("skill_gap_analysis", "ats_score", "tailor_resume"):
+        return bool(self.resume_data and self.job_data)
+    if action == "rank_projects":
+        return bool(self.resume_data and self.resume_data.get("projects"))
+    return False
+```
+
+The full decision ladder:
+
+| Situation | What happens |
+|---|---|
+| Ollama up, model picks a valid pending tool | Executed as-is |
+| Model picks an invalid / repeated / out-of-order tool | Overridden → next pending tool in `ORDERED_TOOLS` |
+| Model returns garbage / no recognizable tool | Same override (garbage "FINAL" is also overridden) |
+| Ollama down / timeout / empty response | `_llm_available=False` → `_fallback_decision(step_idx)` |
+| All 6 tools completed | `_next_planned_tool()` returns `FINAL` → loop breaks |
+
+This makes the agent **resilient** — it completes the full workflow with or without the LLM.
 
 ---
 
@@ -255,7 +298,7 @@ This makes the agent **resilient** — it works with or without the LLM.
 
 **Async handling:** Streamlit is synchronous. The agent uses `asyncio`. We bridge them by creating a new event loop and calling `loop.run_until_complete(run_agent(...))`. This keeps the UI responsive during agent execution.
 
-**Note on sidebar:** The sidebar currently references "Qwen 3.5 via Ollama + MCP" but also has an outdated Ollama troubleshooting message referencing the wrong model. These are cosmetic and don't affect functionality.
+**Live per-step results:** `progress_callback()` stores each MCP observation in `st.session_state.step_results`, and `_render_status()` shows it inline under each completed step in the activity panel (an expandable "Result" JSON snippet, truncated to 800 chars). The full history remains available in the "Workflow Log" tab after completion.
 
 ---
 
@@ -272,10 +315,13 @@ This makes the agent **resilient** — it works with or without the LLM.
 | `run()` | Main entry — spawn MCP server, connect, loop, report |
 | `_build_react_prompt()` | Constructs the LLM prompt with current state |
 | `_fallback_decision()` | Deterministic plan when LLM is down |
-| `_parse_action()` | Extracts tool name/input from LLM output |
+| `_parse_action()` | Extracts tool name/input/thought from LLM output |
 | `_fill_tool_inputs()` | Auto-fills missing tool params from stored context |
 | `_parse_mcp_result()` | Converts MCP response to Python dict |
 | `_store_result()` | Saves tool output to the correct field |
+| `_validate_decision()` | Overrides invalid/repeated/out-of-order LLM choices |
+| `_next_planned_tool()` | Returns the next pending tool in `ORDERED_TOOLS` |
+| `_deps_satisfied()` | Checks a tool's data dependencies are available |
 | `_generate_final_report()` | Assembles all results into final dict |
 | `_build_report_text()` | Creates Markdown report string |
 
@@ -298,6 +344,8 @@ TOOL_INPUT_MAP = {
 ```
 
 **Why this matters:** The LLM only needs to say "call skill_gap_analysis" — the controller automatically attaches the resume_data and job_data from its context. The LLM never needs to pass large data blobs.
+
+**ORDERED_TOOLS & guided validation:** Because Qwen 3.5 2B frequently proposes invalid or repeated tool calls, the controller also maintains `ORDERED_TOOLS` (the standard 6-step sequence). `_validate_decision()` accepts the LLM's choice only when it is valid and its dependencies are met (`_deps_satisfied()`); otherwise `_next_planned_tool()` supplies the next pending tool. See [§4 Fallback Plan & Guided Validation](#4-the-react-agent-pattern) for the full decision ladder.
 
 ---
 
@@ -400,13 +448,15 @@ The `@mcp.tool()` decorator:
 - Uses `httpx` for HTTP with connection pooling.
 - Default model: `qwen3.5:2b-q4_K_M`.
 - Default endpoint: `http://localhost:11434`.
-- Timeout: 60 seconds (Ollama on CPU can be slow).
+- Timeout: 600 seconds — Ollama on CPU is slow, and Qwen 3.5 is a 2.3B model. A full generation can take several minutes, so the timeout must comfortably exceed that or the agent falls back unnecessarily.
+- `think: False` — **critical for Qwen3 models.** By default Qwen3 runs in "thinking mode" and spends all its output tokens on internal reasoning, returning an **empty** response. Disabling thinking makes it respond in ~4s instead of timing out with nothing.
+- `num_predict: 256` — ReAct responses are short (`Thought:` + `Action:`), so 256 tokens is plenty and keeps generation fast (was 2048).
 - Pydantic models: `GenerationConfig` and `OllamaResponse` for request/response validation.
 
 **Error handling:**
 - `ConnectionError` — Ollama not running (provide clear message to run `ollama serve`).
 - `ValueError` — Model not found (provide clear message to run `ollama pull`).
-- Generic `RuntimeError` — Other HTTP errors.
+- `RuntimeError` — Other HTTP errors, **including an empty response**. If the model returns no text, the client raises instead of returning `""` — this prevents the agent from silently treating an empty reply as "done" and producing an empty report.
 
 **Why Ollama instead of a cloud API?** The project was designed to run fully locally with no cloud dependencies. Qwen 3.5 provides reasonable reasoning capability for the ReAct loop while running on consumer hardware. If Ollama is too slow on a given machine, the agent auto-falls back to the deterministic plan.
 
@@ -534,7 +584,7 @@ The agent controller handles this automatically via `_fill_tool_inputs()` — if
 
 ### If Ollama is Unavailable
 
-The `OllamaClient.generate()` call raises an exception (connection refused, model not found, timeout). The agent controller catches it:
+The `OllamaClient.generate()` call raises an exception (connection refused, model not found, timeout, empty response). The agent controller catches it:
 
 ```python
 try:
@@ -542,17 +592,26 @@ try:
         raise RuntimeError("LLM previously failed, skip")
     prompt = self._build_react_prompt(tool_names)
     llm_response = self.llm.generate(prompt, system=REACT_SYSTEM_PROMPT)
-    action, action_input = self._parse_action(llm_response)
+    action, action_input, thought = self._parse_action(llm_response)
 except Exception as e:
     self._llm_available = False
     logger.warning(f"LLM unavailable, using fallback plan: {e}")
-    action, action_input = self._fallback_decision(step_idx)
+    action, action_input, thought = self._fallback_decision(step_idx)
 ```
 
 Key details:
 - After the **first** failure, `_llm_available` is set to `False`, skipping all subsequent LLM calls.
 - Remaining steps use the deterministic fallback plan (instant, no waiting).
 - Without Ollama running, all steps use the fallback (the agent still works).
+
+### If the LLM Makes a Bad Decision (still available)
+
+Even when Ollama responds, a small model may choose the wrong tool. `_validate_decision()` catches this *after* the LLM call succeeds:
+- Invalid tool name → overridden to the next pending tool in `ORDERED_TOOLS`.
+- Already-completed tool (e.g. calling `read_resume` twice) → overridden.
+- Tool whose dependencies aren't ready (e.g. `skill_gap_analysis` before `analyze_job_description`) → overridden via `_deps_satisfied()`.
+
+This is a second safety net that keeps the workflow deterministic even when the LLM is "working" but unreliable.
 
 ### If the PDF is Invalid
 
@@ -576,9 +635,11 @@ The `stdio_client` context manager throws an exception, caught by the outer try-
 2. **Register it** in `mcp_server/server.py` with `@mcp.tool()`.
 3. **Update the agent** in `agent_controller.py`:
    - Add the tool to `TOOL_INPUT_MAP` if it needs auto-filled inputs.
+   - Add the tool to `ORDERED_TOOLS` if it should be part of the standard workflow sequence.
    - Add a storage field (e.g., `self.new_tool_result`).
    - Add a case in `_store_result()`.
    - Add a case in `_fill_tool_inputs()` if needed.
+   - Add a case in `_deps_satisfied()` if the tool has data dependencies.
    - Update `_generate_final_report()` to include the new data.
 4. **Update the frontend** in `app.py` — add a new results tab or section.
 
@@ -629,14 +690,14 @@ The file `prompt.txt` at the project root contains the exact prompt that was giv
 
 | File | Layer | Purpose |
 |------|-------|---------|
-| `app.py` | Frontend | Streamlit UI — upload, input, progress, results |
-| `agent/agent_controller.py` | Agent | ReAct loop, MCP client, state management, report |
+| `app.py` | Frontend | Streamlit UI — upload, input, progress, results; live per-step result snippets |
+| `agent/agent_controller.py` | Agent | ReAct loop, guided plan validation, MCP client, state management, report |
 | `agent/memory.py` | Agent | Step tracking, context storage |
 | `mcp_server/server.py` | MCP Server | FastMCP server with 6 tool registrations |
 | `mcp_server/resume_tools.py` | MCP Tool | read_resume implementation |
 | `mcp_server/analysis_tools.py` | MCP Tools | analyze_jd, skill_gap, ats_score implementations |
 | `mcp_server/tailoring_tools.py` | MCP Tools | rank_projects, tailor_resume implementations |
-| `models/ollama_client.py` | LLM Client | Ollama HTTP client (Qwen 3.5) |
+| `models/ollama_client.py` | LLM Client | Ollama HTTP client (Qwen 3.5) — `think: False`, 600s timeout, empty-response guard |
 | `utils/pdf_parser.py` | Utility | PDF text extraction and section splitting |
 | `utils/skill_extractor.py` | Utility | Keyword-based skill detection (~130 skills) |
 | `utils/ats.py` | Utility | ATS scoring and recommendation generation |

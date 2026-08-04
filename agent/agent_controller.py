@@ -21,7 +21,7 @@ import json
 import sys
 import os
 import logging
-from typing import Dict, Any, Optional, Callable, List, Tuple
+from typing import Dict, Any, Optional, Callable, List, Tuple, Set
 
 # Add project root to path for imports when running as subprocess
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -61,7 +61,12 @@ Work through the steps in order:
 6. tailor_resume
 7. Output Final Answer
 
-Output format:
+IMPORTANT: The ONLY valid tool names are:
+read_resume, analyze_job_description, skill_gap_analysis, ats_score, rank_projects, tailor_resume.
+Never invent or use any other tool name.
+
+Output format (one action per response):
+Thought: <one sentence explaining why>
 Action: tool_name
 Action Input: {{"param": "value"}}
 
@@ -79,6 +84,17 @@ TOOL_INPUT_MAP: Dict[str, str] = {
     "rank_projects": "projects+job_description",
     "tailor_resume": "resume_data+job_data",
 }
+
+# The standard workflow order. Used to enforce a valid sequence even when
+# the (small local) LLM proposes an invalid or repeated tool call.
+ORDERED_TOOLS: List[str] = [
+    "read_resume",
+    "analyze_job_description",
+    "skill_gap_analysis",
+    "ats_score",
+    "rank_projects",
+    "tailor_resume",
+]
 
 
 class AgentController:
@@ -159,7 +175,9 @@ class AgentController:
 
                     # ReAct loop — try up to 12 iterations
                     max_steps = 12
+                    completed_tools: Set[str] = set()
                     for step_idx in range(max_steps):
+                        thought = ""
                         try:
                             if not self._llm_available:
                                 raise RuntimeError("LLM previously failed, skip")
@@ -167,31 +185,41 @@ class AgentController:
                             llm_response = self.llm.generate(
                                 prompt,
                                 system=REACT_SYSTEM_PROMPT,
-                                temperature=0.3,
+                                temperature=0.1 ,
                             )
-                            action, action_input = self._parse_action(llm_response)
+                            action, action_input, thought = self._parse_action(llm_response)
                         except Exception as e:
                             self._llm_available = False
                             logger.warning(f"LLM unavailable, using fallback plan: {e}")
-                            action, action_input = self._fallback_decision(step_idx)
+                            action, action_input, thought = self._fallback_decision(step_idx)
 
-                        # LLM says we're done
+                        # Enforce the plan: only accept valid, pending tools whose
+                        # dependencies are satisfied; otherwise pick the next planned tool.
+                        proposed_action = action
+                        action, action_input = self._validate_decision(
+                            action, action_input, tool_names, completed_tools
+                        )
+
+                        # If the plan overrode the LLM's choice, don't show the LLM's
+                        # thought (it reasoned about a different action).
+                        if action != proposed_action:
+                            thought = ""
+
+                        # All steps are done
                         if action == "FINAL":
                             if progress_callback:
                                 progress_callback("finalizing", {})
                             break
 
-                        # Validate the action is a known tool
-                        if action not in tool_names:
-                            action, action_input = self._fallback_decision(step_idx)
+                        if not thought:
+                            thought = f"Calling {action} to gather more information."
 
                         # Fill in any missing input parameters from agent context
                         filled_input = self._fill_tool_inputs(action, action_input)
 
                         if not filled_input:
+                            completed_tools.add(action)
                             continue
-
-                        thought = f"Calling {action} to gather more information."
 
                         # Execute the tool via MCP
                         try:
@@ -205,6 +233,7 @@ class AgentController:
 
                         # Store the result in the appropriate field
                         self._store_result(action, observation)
+                        completed_tools.add(action)
 
                         # Record the step in agent memory
                         step = AgentStep(thought, action, filled_input, observation)
@@ -286,7 +315,7 @@ class AgentController:
 
         return "\n".join(parts)
 
-    def _fallback_decision(self, step_idx: int) -> Tuple[str, Dict[str, Any]]:
+    def _fallback_decision(self, step_idx: int) -> Tuple[str, Dict[str, Any], str]:
         """Deterministic fallback plan when LLM is unavailable.
         
         Follows the standard 6-step workflow in order:
@@ -297,25 +326,73 @@ class AgentController:
             step_idx: Current iteration index in the ReAct loop.
             
         Returns:
-            Tuple of (action_name, action_input_dict).
+            Tuple of (action_name, action_input_dict, thought_text).
         """
-        ordered_tools = [
-            ("read_resume", {}),
-            ("analyze_job_description", {}),
-            ("skill_gap_analysis", {}),
-            ("ats_score", {}),
-            ("rank_projects", {}),
-            ("tailor_resume", {}),
-        ]
-        if step_idx < len(ordered_tools):
-            return ordered_tools[step_idx]
+        if step_idx < len(ORDERED_TOOLS):
+            tool = ORDERED_TOOLS[step_idx]
+            return (tool, {}, f"Using fallback plan (Ollama unavailable): calling {tool}.")
+        return ("FINAL", {}, "")
+
+    def _validate_decision(
+        self,
+        action: str,
+        action_input: Dict[str, Any],
+        tool_names: List[str],
+        completed_tools: Set[str],
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Enforce the workflow plan regardless of the LLM's choice.
+        
+        A small local model (e.g. Qwen 3.5 2B) frequently proposes invalid,
+        repeated, or out-of-order tool calls. This method accepts the LLM's
+        decision only when it is a known, not-yet-completed tool whose data
+        dependencies are satisfied. Otherwise it returns the next pending
+        tool in the standard workflow order.
+        
+        Args:
+            action: Proposed action from the LLM or fallback plan.
+            action_input: Proposed input parameters.
+            tool_names: List of available MCP tool names.
+            completed_tools: Set of tools already executed this run.
+            
+        Returns:
+            Tuple of (valid_action, action_input).
+        """
+        if action not in tool_names or action in completed_tools or not self._deps_satisfied(action):
+            return self._next_planned_tool(completed_tools)
+        return (action, action_input)
+
+    def _next_planned_tool(self, completed_tools: Set[str]) -> Tuple[str, Dict[str, Any]]:
+        """Return the first not-yet-completed tool in the standard workflow order."""
+        for tool in ORDERED_TOOLS:
+            if tool not in completed_tools:
+                return (tool, {})
         return ("FINAL", {})
 
-    def _parse_action(self, llm_response: str) -> Tuple[str, Dict[str, Any]]:
+    def _deps_satisfied(self, action: str) -> bool:
+        """Check that all data dependencies for a tool are currently available.
+        
+        Prevents out-of-order tool calls (e.g. running skill_gap_analysis
+        before the job description has been analyzed).
+        
+        Args:
+            action: The MCP tool name.
+            
+        Returns:
+            True if the tool can run with the data collected so far.
+        """
+        if action in ("read_resume", "analyze_job_description"):
+            return True
+        if action in ("skill_gap_analysis", "ats_score", "tailor_resume"):
+            return bool(self.resume_data and self.job_data)
+        if action == "rank_projects":
+            return bool(self.resume_data and self.resume_data.get("projects"))
+        return False
+
+    def _parse_action(self, llm_response: str) -> Tuple[str, Dict[str, Any], str]:
         """Parse the LLM's response to extract the next action.
         
         Supports two formats:
-        1. "Action: tool_name\nAction Input: {...}" — tool call
+        1. "Thought: ...\nAction: tool_name\nAction Input: {...}" — tool call
         2. "Final Answer: ..." — completion signal
         
         Falls back to heuristic tool name detection if the format is off.
@@ -324,13 +401,19 @@ class AgentController:
             llm_response: Raw text output from the LLM.
             
         Returns:
-            Tuple of (action_name, action_input_dict).
+            Tuple of (action_name, action_input_dict, thought_text).
         """
         import re
 
         # Check for final answer
         if "Final Answer:" in llm_response or "FINAL" in llm_response:
-            return ("FINAL", {})
+            return ("FINAL", {}, "")
+
+        # Capture the LLM's reasoning for the workflow log
+        thought = ""
+        thought_match = re.search(r"Thought:\s*(.+)", llm_response, re.DOTALL)
+        if thought_match:
+            thought = thought_match.group(1).strip()
 
         # Try to extract structured action/input
         action_match = re.search(r"Action:\s*(\w+)", llm_response)
@@ -343,8 +426,8 @@ class AgentController:
                 "ats_score", "rank_projects", "tailor_resume",
             ]:
                 if tool in llm_response:
-                    return (tool, {})
-            return ("FINAL", {})
+                    return (tool, {}, thought)
+            return ("FINAL", {}, thought)
 
         action = action_match.group(1)
         action_input: Dict[str, Any] = {}
@@ -354,7 +437,7 @@ class AgentController:
             except json.JSONDecodeError:
                 action_input = {}
 
-        return (action, action_input)
+        return (action, action_input, thought)
 
     def _fill_tool_inputs(self, action: str, action_input: Dict[str, Any]) -> Dict[str, Any]:
         """Auto-fill required tool inputs from the agent's context.
